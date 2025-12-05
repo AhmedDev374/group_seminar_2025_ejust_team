@@ -1,0 +1,791 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+import numpy as np
+import random
+import time
+import threading
+from datetime import datetime
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+# SIMPLE SYSTEM CLASSES - CLEAR STRUCTURE
+# ============================================================================
+
+class ESP32Device:
+    """ESP-32 Device with clear role definition"""
+
+    def __init__(self, device_id, role, location):
+        self.id = device_id
+        self.role = role  # "receiver", "pollution_sender", "emergency_sender"
+        self.location = location
+        self.battery = 100
+        self.is_active = True
+        self.message_count = 0
+
+    def send_message(self, message_type, receiver_id):
+        """Send message via ESP-NOW protocol"""
+        if self.is_active and self.battery > 0:
+            self.message_count += 1
+            self.battery -= 0.5  # Lower battery consumption
+            return {
+                "sender": self.id,
+                "receiver": receiver_id,
+                "message": message_type,
+                "timestamp": datetime.now().strftime("%H:%M:%S")
+            }
+        return None
+
+    def get_status(self):
+        return f"{self.id} ({self.role}) - Battery: {self.battery:.1f}% - Active: {self.is_active}"
+
+
+class Car:
+    """Car with ESP-32 receiver"""
+
+    def __init__(self, car_id, car_type="normal", has_receiver=False):
+        self.id = car_id
+        self.type = car_type  # "normal", "fire_truck", "receiver_car"
+        self.position = (random.randint(0, 50), 0)
+        self.status = "normal"
+        self.has_receiver = has_receiver
+        self.received_messages = []
+        self.route = "main_road"
+
+    def receive_message(self, message):
+        """Car receives message from ESP-32"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        action = self._take_action(message)
+
+        self.received_messages.append({
+            "time": timestamp,
+            "message": message,
+            "action": action
+        })
+        return self.received_messages[-1]
+
+    def _take_action(self, message):
+        """Car takes action based on received message"""
+        if "congestion" in message:
+            self.status = "rerouting"
+            self.route = "alternative_route"
+            return "Taking alternative route to avoid congestion"
+        elif "make_space" in message or "green_corridor" in message:
+            self.status = "moving_aside"
+            self.route = "right_side"
+            return "Creating green corridor for emergency vehicle"
+        else:
+            return "No action needed"
+
+    def update_position(self):
+        """Update car position based on status"""
+        if self.status == "normal":
+            self.position = (self.position[0] + 1, 0)
+        elif self.status == "rerouting":
+            self.position = (self.position[0] + 0.5, -1)  # Slower on alternative route
+        elif self.status == "moving_aside":
+            self.position = (self.position[0] + 0.3, 1)  # Moving to side
+
+    def get_status(self):
+        return f"{self.id} ({self.type}) - Status: {self.status} - Route: {self.route}"
+
+
+class MQ135_Sensor:
+    """MQ-135 Gas/Pollution Sensor at traffic light"""
+
+    def __init__(self, sensor_id="MQ135_01", location="traffic_light"):
+        self.id = sensor_id
+        self.location = location
+        self.threshold = 350  # ppm
+        self.current_reading = 300
+        self.reading_history = []
+
+    def read_pollution(self):
+        """Simulate pollution reading"""
+        # Base pollution + random variation + occasional spikes
+        base = 250
+        variation = random.randint(-30, 80)
+        spike_chance = random.random()
+
+        if spike_chance < 0.15:  # 15% chance of pollution spike
+            self.current_reading = base + variation + random.randint(100, 200)
+        else:
+            self.current_reading = base + variation
+
+        self.current_reading = max(200, min(600, self.current_reading))
+        self.reading_history.append(self.current_reading)
+
+        # Keep only last 50 readings
+        if len(self.reading_history) > 50:
+            self.reading_history.pop(0)
+
+        return self.current_reading
+
+    def check_congestion(self):
+        """Check if pollution indicates congestion"""
+        is_congestion = self.current_reading > self.threshold
+        if is_congestion:
+            return True, f"High pollution detected: {self.current_reading} ppm (> {self.threshold} ppm)"
+        return False, f"Normal pollution: {self.current_reading} ppm"
+
+
+class Ultrasonic_Sensor:
+    """Ultrasonic Distance Sensor on fire truck"""
+
+    def __init__(self, sensor_id="US_01", location="fire_truck"):
+        self.id = sensor_id
+        self.location = location
+        self.threshold = 5  # cm
+        self.current_distance = 20  # Start with safe distance
+        self.distance_history = []
+
+    def measure_distance(self):
+        """Simulate distance measurement to car in front"""
+        # Random distance change with occasional close approach
+        change = random.choice([-3, -2, -1, 0, 1, 2])
+        self.current_distance = max(1, min(40, self.current_distance + change))
+
+        # 20% chance of emergency situation
+        if random.random() < 0.2:
+            self.current_distance = random.randint(1, 5)
+
+        self.distance_history.append(self.current_distance)
+
+        # Keep only last 50 readings
+        if len(self.distance_history) > 50:
+            self.distance_history.pop(0)
+
+        return self.current_distance
+
+    def check_emergency(self):
+        """Check if distance requires emergency action"""
+        is_emergency = self.current_distance <= self.threshold
+        if is_emergency:
+            return True, f"Emergency distance: {self.current_distance} cm (≤ {self.threshold} cm)"
+        return False, f"Safe distance: {self.current_distance} cm"
+
+
+# ============================================================================
+# MAIN TRAFFIC SYSTEM - FIXED VERSION
+# ============================================================================
+
+class TrafficManagementSystem:
+    """Main system coordinating all components"""
+
+    def __init__(self):
+        # Initialize event logs FIRST
+        self.event_log = []
+        self.message_log = []
+        self.simulation_time = 0
+        self.is_running = False
+        self.update_speed = 1.0  # Normal speed
+
+        # Then initialize components
+        self.initialize_components()
+
+    def initialize_components(self):
+        """Set up all system components exactly as described"""
+        print("Initializing Traffic Management System...")
+
+        # 1. Create 5 cars (1 receiver car + 3 normal cars + 1 fire truck)
+        self.cars = []
+        self.cars.append(Car("Receiver Car", "receiver_car", has_receiver=True))  # Receiver car
+        self.cars.append(Car("Car 2", "normal"))
+        self.cars.append(Car("Car 3", "normal"))
+        self.cars.append(Car("Car 4", "normal"))
+        self.cars.append(Car("Fire Truck", "fire_truck"))  # Fire truck
+
+        # 2. Create 3 ESP-32 devices
+        self.esp_devices = []
+        # Receiver on car
+        self.esp_devices.append(ESP32Device("ESP_RX_01", "receiver", "Receiver Car"))
+        # Pollution sender at traffic light
+        self.esp_devices.append(ESP32Device("ESP_TX_P01", "pollution_sender", "Traffic Light"))
+        # Emergency sender on fire truck
+        self.esp_devices.append(ESP32Device("ESP_TX_E01", "emergency_sender", "Fire Truck"))
+
+        # 3. Create sensors
+        self.pollution_sensor = MQ135_Sensor()
+        self.ultrasonic_sensor = Ultrasonic_Sensor()
+
+        self.log_event("SYSTEM", "System initialized")
+        self.log_event("SYSTEM", "5 cars: 1 receiver, 3 normal, 1 fire truck")
+        self.log_event("SYSTEM", "3 ESP-32 devices: receiver, pollution sender, emergency sender")
+        self.log_event("SYSTEM", "2 sensors: MQ-135 (traffic light), Ultrasonic (fire truck)")
+        self.log_event("SYSTEM", "ESP-NOW protocol active")
+
+    def run_one_cycle(self):
+        """Run one complete simulation cycle"""
+        if not self.is_running:
+            return
+
+        self.simulation_time += 1
+
+        # Update car positions
+        for car in self.cars:
+            car.update_position()
+
+        # --- POLLUTION MONITORING PROCESS ---
+        pollution_level = self.pollution_sensor.read_pollution()
+        is_congestion, pollution_msg = self.pollution_sensor.check_congestion()
+
+        if is_congestion:
+            # Pollution sender ESP-32 sends "congestion" message
+            message_data = self.esp_devices[1].send_message("congestion", "ESP_RX_01")
+            if message_data:
+                # Receiver car gets message and takes action
+                response = self.cars[0].receive_message("congestion")
+                self.log_event("POLLUTION SYSTEM", pollution_msg)
+                self.log_message(message_data, response)
+                # Other cars also get congestion signal
+                for car in self.cars[1:4]:  # Normal cars only
+                    car.receive_message("congestion")
+
+        # --- EMERGENCY VEHICLE SYSTEM ---
+        distance = self.ultrasonic_sensor.measure_distance()
+        is_emergency, distance_msg = self.ultrasonic_sensor.check_emergency()
+
+        if is_emergency:
+            # Emergency sender ESP-32 sends "make_space" message
+            message_data = self.esp_devices[2].send_message("make_space", "ESP_RX_01")
+            if message_data:
+                # Receiver car gets message and takes action
+                response = self.cars[0].receive_message("make_space")
+                self.log_event("EMERGENCY SYSTEM", distance_msg)
+                self.log_message(message_data, response)
+                # Normal cars also move aside
+                for car in self.cars[1:4]:  # Normal cars only
+                    car.receive_message("make_space")
+
+        # Reset status after some time
+        if self.simulation_time % 20 == 0:
+            for car in self.cars:
+                if car.status != "normal":
+                    car.status = "normal"
+                    car.route = "main_road"
+
+    def log_event(self, system, message):
+        """Log system events"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        event = f"[{timestamp}] [{system}] {message}"
+        self.event_log.append(event)
+
+    def log_message(self, message_data, response):
+        """Log ESP-NOW messages"""
+        log_entry = {
+            "time": message_data["timestamp"],
+            "sender": message_data["sender"],
+            "receiver": message_data["receiver"],
+            "message": message_data["message"],
+            "action": response["action"]
+        }
+        self.message_log.append(log_entry)
+
+    def get_system_status(self):
+        """Get current status of all components"""
+        status = {
+            "simulation_time": self.simulation_time,
+            "pollution_level": self.pollution_sensor.current_reading,
+            "distance": self.ultrasonic_sensor.current_distance,
+            "receiver_messages": len(self.cars[0].received_messages),
+            "esp_batteries": [esp.battery for esp in self.esp_devices],
+            "active_events": {
+                "congestion": self.pollution_sensor.current_reading > self.pollution_sensor.threshold,
+                "emergency": self.ultrasonic_sensor.current_distance <= self.ultrasonic_sensor.threshold
+            }
+        }
+        return status
+
+    def start_simulation(self):
+        """Start continuous system operation"""
+        self.is_running = True
+        self.log_event("SYSTEM", "Simulation started")
+
+    def pause_simulation(self):
+        """Pause system operation"""
+        self.is_running = False
+        self.log_event("SYSTEM", "Simulation paused")
+
+    def set_simulation_speed(self, speed):
+        """Set simulation speed multiplier"""
+        self.update_speed = speed
+
+    def manual_trigger_congestion(self):
+        """Manually trigger congestion event"""
+        self.pollution_sensor.current_reading = 400
+        self.log_event("CONTROL", "Manual congestion triggered")
+
+    def manual_trigger_emergency(self):
+        """Manually trigger emergency event"""
+        self.ultrasonic_sensor.current_distance = 3
+        self.log_event("CONTROL", "Manual emergency triggered")
+
+    def reset_system(self):
+        """Reset all components"""
+        self.is_running = False
+        # Reinitialize everything
+        self.event_log = []
+        self.message_log = []
+        self.simulation_time = 0
+        self.update_speed = 1.0
+        self.initialize_components()
+
+
+# ============================================================================
+# AUTO-RUN GUI WITH CONTROL PANEL - SIMPLIFIED VERSION
+# ============================================================================
+
+class AutoTrafficSystemGUI:
+    """GUI that runs automatically with control panel"""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Auto Traffic Management System - ESP-32 Network")
+        self.root.geometry("1400x800")
+
+        # Initialize system
+        self.system = TrafficManagementSystem()
+
+        # Create GUI
+        self.setup_gui()
+
+        # Start simulation automatically
+        self.system.start_simulation()
+
+        # Start update loop
+        self.update_interval = 500  # Update every 500ms
+        self.root.after(100, self.update_system)
+
+    def setup_gui(self):
+        """Create GUI with auto-running simulation and control panel"""
+        # Main container
+        main_container = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # ========== LEFT PANEL: SYSTEM VISUALIZATION ==========
+        left_panel = ttk.Frame(main_container)
+        main_container.add(left_panel, weight=2)
+
+        # Create notebook for different views
+        self.viz_notebook = ttk.Notebook(left_panel)
+        self.viz_notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 1: Road View
+        road_frame = ttk.Frame(self.viz_notebook)
+        self.viz_notebook.add(road_frame, text="🚦 Road View")
+
+        # Road visualization canvas
+        self.figure = Figure(figsize=(10, 6), dpi=80)
+        self.canvas = FigureCanvasTkAgg(self.figure, road_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Tab 2: Sensor Data
+        sensor_frame = ttk.Frame(self.viz_notebook)
+        self.viz_notebook.add(sensor_frame, text="📊 Sensor Data")
+
+        # Create sensor plots
+        self.sensor_figure = Figure(figsize=(10, 6), dpi=80)
+        self.sensor_canvas = FigureCanvasTkAgg(self.sensor_figure, sensor_frame)
+        self.sensor_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Tab 3: Messages
+        msg_frame = ttk.Frame(self.viz_notebook)
+        self.viz_notebook.add(msg_frame, text="📨 Messages")
+
+        # Message display
+        self.msg_text = tk.Text(msg_frame, height=20, width=60, bg='black', fg='white',
+                                font=('Courier', 10))
+        scrollbar = ttk.Scrollbar(msg_frame, command=self.msg_text.yview)
+        self.msg_text.config(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.msg_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.msg_text.insert(tk.END, "ESP-NOW MESSAGE LOG\n")
+        self.msg_text.insert(tk.END, "=" * 50 + "\n\n")
+
+        # ========== RIGHT PANEL: CONTROL PANEL & STATUS ==========
+        right_panel = ttk.Frame(main_container)
+        main_container.add(right_panel, weight=1)
+
+        # Create notebook for controls
+        control_notebook = ttk.Notebook(right_panel)
+        control_notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 1: System Controls
+        control_frame = ttk.Frame(control_notebook)
+        control_notebook.add(control_frame, text="⚙️ Controls")
+
+        # Control buttons
+        btn_frame = ttk.LabelFrame(control_frame, text="Simulation Controls", padding=10)
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(btn_frame, text="▶ Start", command=self.start_sim,
+                   width=15).pack(pady=2)
+        ttk.Button(btn_frame, text="⏸ Pause", command=self.pause_sim,
+                   width=15).pack(pady=2)
+        ttk.Button(btn_frame, text="🔄 Reset", command=self.reset_sim,
+                   width=15).pack(pady=2)
+        ttk.Button(btn_frame, text="🚨 Emergency", command=self.manual_emergency,
+                   width=15).pack(pady=2)
+        ttk.Button(btn_frame, text="🚗 Congestion", command=self.manual_congestion,
+                   width=15).pack(pady=2)
+
+        # Speed control
+        speed_frame = ttk.LabelFrame(control_frame, text="Simulation Speed", padding=10)
+        speed_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.speed_var = tk.DoubleVar(value=1.0)
+        speed_scale = ttk.Scale(speed_frame, from_=0.1, to=3.0, variable=self.speed_var,
+                                orient=tk.HORIZONTAL, command=self.update_speed)
+        speed_scale.pack(fill=tk.X, padx=10)
+
+        self.speed_label = ttk.Label(speed_frame, text="Speed: 1.0x")
+        self.speed_label.pack()
+
+        # ESP-32 Controls
+        esp_frame = ttk.LabelFrame(control_frame, text="ESP-32 Controls", padding=10)
+        esp_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.esp_vars = {}
+        for esp in self.system.esp_devices:
+            var = tk.BooleanVar(value=True)
+            self.esp_vars[esp.id] = var
+            cb = ttk.Checkbutton(esp_frame, text=esp.id, variable=var,
+                                 command=lambda e=esp, v=var: self.toggle_esp(e, v))
+            cb.pack(anchor=tk.W, pady=2)
+
+        # Sensor Controls
+        sensor_ctrl_frame = ttk.LabelFrame(control_frame, text="Sensor Settings", padding=10)
+        sensor_ctrl_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Pollution threshold
+        ttk.Label(sensor_ctrl_frame, text="Pollution Threshold:").pack(anchor=tk.W)
+        self.poll_thresh_var = tk.IntVar(value=350)
+        poll_spin = ttk.Spinbox(sensor_ctrl_frame, from_=200, to=600, textvariable=self.poll_thresh_var,
+                                width=10, command=self.update_pollution_threshold)
+        poll_spin.pack(fill=tk.X, pady=(0, 10))
+
+        # Distance threshold
+        ttk.Label(sensor_ctrl_frame, text="Emergency Distance:").pack(anchor=tk.W)
+        self.dist_thresh_var = tk.IntVar(value=5)
+        dist_spin = ttk.Spinbox(sensor_ctrl_frame, from_=1, to=20, textvariable=self.dist_thresh_var,
+                                width=10, command=self.update_distance_threshold)
+        dist_spin.pack(fill=tk.X)
+
+        # Tab 2: System Status
+        status_frame = ttk.Frame(control_notebook)
+        control_notebook.add(status_frame, text="📈 Status")
+
+        # Real-time status display
+        self.status_text = tk.Text(status_frame, height=25, width=40, bg='black', fg='white',
+                                   font=('Courier', 10))
+        scrollbar = ttk.Scrollbar(status_frame, command=self.status_text.yview)
+        self.status_text.config(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.status_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Tab 3: Event Log
+        log_frame = ttk.Frame(control_notebook)
+        control_notebook.add(log_frame, text="📝 Events")
+
+        self.log_text = tk.Text(log_frame, height=25, width=40, bg='black', fg='white',
+                                font=('Courier', 9))
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.config(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Status bar at bottom
+        self.status_bar = ttk.Label(self.root, text="System Ready | Auto-running...", relief=tk.SUNKEN)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def update_speed(self, value):
+        """Update simulation speed"""
+        speed = float(value)
+        self.system.set_simulation_speed(speed)
+        self.speed_label.config(text=f"Speed: {speed:.1f}x")
+        self.update_interval = int(500 / speed)  # Adjust update interval based on speed
+
+    def toggle_esp(self, esp, var):
+        """Toggle ESP-32 device"""
+        esp.is_active = var.get()
+        status = "activated" if esp.is_active else "deactivated"
+        self.system.log_event("CONTROL", f"{esp.id} {status}")
+
+    def update_pollution_threshold(self):
+        """Update pollution threshold"""
+        self.system.pollution_sensor.threshold = self.poll_thresh_var.get()
+        self.system.log_event("CONTROL", f"Pollution threshold set to {self.poll_thresh_var.get()} ppm")
+
+    def update_distance_threshold(self):
+        """Update distance threshold"""
+        self.system.ultrasonic_sensor.threshold = self.dist_thresh_var.get()
+        self.system.log_event("CONTROL", f"Emergency distance set to {self.dist_thresh_var.get()} cm")
+
+    def manual_emergency(self):
+        """Trigger emergency manually"""
+        self.system.manual_trigger_emergency()
+
+    def manual_congestion(self):
+        """Trigger congestion manually"""
+        self.system.manual_trigger_congestion()
+
+    def start_sim(self):
+        """Start simulation"""
+        self.system.start_simulation()
+        self.status_bar.config(text="System: Running")
+
+    def pause_sim(self):
+        """Pause simulation"""
+        self.system.pause_simulation()
+        self.status_bar.config(text="System: Paused")
+
+    def reset_sim(self):
+        """Reset simulation"""
+        self.system.reset_system()
+        self.status_bar.config(text="System: Reset")
+        # Update ESP checkboxes
+        for esp in self.system.esp_devices:
+            self.esp_vars[esp.id].set(True)
+
+    def update_system(self):
+        """Update the entire system"""
+        try:
+            if self.system.is_running:
+                # Run simulation cycle
+                self.system.run_one_cycle()
+
+                # Update all visualizations
+                self.update_road_view()
+                self.update_sensor_plots()
+                self.update_status_display()
+                self.update_message_log()
+                self.update_event_log()
+
+                # Update status bar
+                status = self.system.get_system_status()
+                self.status_bar.config(
+                    text=f"Time: {status['simulation_time']} | "
+                         f"Pollution: {status['pollution_level']} ppm | "
+                         f"Distance: {status['distance']} cm | "
+                         f"Messages: {status['receiver_messages']}"
+                )
+
+            # Schedule next update
+            self.root.after(self.update_interval, self.update_system)
+        except Exception as e:
+            print(f"Error in update: {e}")
+            # Continue anyway
+            self.root.after(self.update_interval, self.update_system)
+
+    def update_road_view(self):
+        """Update road visualization"""
+        try:
+            self.figure.clear()
+
+            # Create main road view
+            ax = self.figure.add_subplot(111)
+
+            # Draw road
+            ax.axhline(y=0, color='gray', linewidth=10, alpha=0.3)
+            ax.axhline(y=-1, color='lightgray', linewidth=5, alpha=0.2)  # Alternative route
+            ax.axhline(y=1, color='lightgray', linewidth=5, alpha=0.2)  # Emergency lane
+
+            # Plot cars
+            for car in self.system.cars:
+                x, y = car.position
+                color = 'green' if car.type == 'receiver_car' else 'red' if car.type == 'fire_truck' else 'blue'
+                marker = 's' if car.type == 'fire_truck' else 'o'
+                size = 200 if car.type == 'receiver_car' else 100
+
+                ax.scatter(x, y, c=color, marker=marker, s=size, edgecolors='black', linewidth=2)
+
+                # Add labels
+                label = f"{car.id}\n({car.status})"
+                ax.text(x, y + 0.2, label, fontsize=8, ha='center',
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+
+            # Add traffic light
+            poll_color = 'red' if self.system.pollution_sensor.current_reading > 350 else 'green'
+            ax.scatter(50, 0.5, c=poll_color,
+                       marker='s', s=300, edgecolors='black', linewidth=2)
+            ax.text(50, 0.8, "Traffic Light\nwith MQ-135", fontsize=8, ha='center')
+
+            # Add emergency vehicle indicator
+            if self.system.ultrasonic_sensor.current_distance <= 5:
+                ax.text(30, 1.2, "⚠️ EMERGENCY", fontsize=10, ha='center',
+                        bbox=dict(boxstyle="round,pad=0.5", facecolor='red', alpha=0.7))
+
+            # Add congestion indicator
+            if self.system.pollution_sensor.current_reading > 350:
+                ax.text(30, -1.2, "⚠️ CONGESTION", fontsize=10, ha='center',
+                        bbox=dict(boxstyle="round,pad=0.5", facecolor='orange', alpha=0.7))
+
+            ax.set_xlim(0, 100)
+            ax.set_ylim(-2, 2)
+            ax.set_title("Traffic System - Road View")
+            ax.set_xlabel("Distance")
+            ax.grid(True, alpha=0.3)
+            ax.set_aspect('auto')
+
+            self.canvas.draw()
+        except Exception as e:
+            print(f"Error in road view: {e}")
+
+    def update_sensor_plots(self):
+        """Update sensor data plots"""
+        try:
+            self.sensor_figure.clear()
+
+            # Plot 1: Pollution level
+            ax1 = self.sensor_figure.add_subplot(221)
+            if self.system.pollution_sensor.reading_history:
+                ax1.plot(self.system.pollution_sensor.reading_history, 'g-', linewidth=2)
+            ax1.axhline(y=self.system.pollution_sensor.threshold, color='r', linestyle='--', alpha=0.7)
+            ax1.set_title("Pollution Level (MQ-135)")
+            ax1.set_ylabel("PPM")
+            ax1.grid(True, alpha=0.3)
+
+            # Plot 2: Distance
+            ax2 = self.sensor_figure.add_subplot(222)
+            if self.system.ultrasonic_sensor.distance_history:
+                ax2.plot(self.system.ultrasonic_sensor.distance_history, 'b-', linewidth=2)
+            ax2.axhline(y=self.system.ultrasonic_sensor.threshold, color='r', linestyle='--', alpha=0.7)
+            ax2.set_title("Fire Truck Distance")
+            ax2.set_ylabel("cm")
+            ax2.grid(True, alpha=0.3)
+
+            # Plot 3: ESP-32 Battery
+            ax3 = self.sensor_figure.add_subplot(223)
+            esp_names = [esp.id for esp in self.system.esp_devices]
+            esp_batteries = [esp.battery for esp in self.system.esp_devices]
+            colors = ['green' if b > 50 else 'yellow' if b > 20 else 'red' for b in esp_batteries]
+            ax3.bar(esp_names, esp_batteries, color=colors)
+            ax3.set_title("ESP-32 Battery Levels")
+            ax3.set_ylabel("Battery %")
+            ax3.set_ylim(0, 100)
+
+            # Plot 4: Messages sent
+            ax4 = self.sensor_figure.add_subplot(224)
+            messages_sent = [esp.message_count for esp in self.system.esp_devices]
+            ax4.bar(esp_names, messages_sent, color=['blue', 'orange', 'green'])
+            ax4.set_title("Messages Sent")
+            ax4.set_ylabel("Count")
+
+            self.sensor_figure.tight_layout()
+            self.sensor_canvas.draw()
+        except Exception as e:
+            print(f"Error in sensor plots: {e}")
+
+    def update_status_display(self):
+        """Update system status text"""
+        try:
+            status = self.system.get_system_status()
+
+            self.status_text.delete(1.0, tk.END)
+            self.status_text.insert(tk.END, "=== SYSTEM STATUS ===\n")
+            self.status_text.insert(tk.END, f"Simulation Time: {status['simulation_time']}\n")
+            self.status_text.insert(tk.END, f"Pollution Level: {status['pollution_level']} ppm\n")
+            self.status_text.insert(tk.END, f"Distance: {status['distance']} cm\n")
+            self.status_text.insert(tk.END, f"Messages Received: {status['receiver_messages']}\n\n")
+
+            self.status_text.insert(tk.END, "=== ACTIVE EVENTS ===\n")
+            congestion_active = status['active_events']['congestion']
+            emergency_active = status['active_events']['emergency']
+
+            congestion_str = "ACTIVE 🔴" if congestion_active else "Inactive ✅"
+            emergency_str = "ACTIVE 🔴" if emergency_active else "Inactive ✅"
+
+            self.status_text.insert(tk.END, f"Congestion: {congestion_str}\n")
+            self.status_text.insert(tk.END, f"Emergency: {emergency_str}\n")
+
+            self.status_text.insert(tk.END, "\n=== ESP-32 STATUS ===\n")
+            for esp in self.system.esp_devices:
+                active_str = "Active ✅" if esp.is_active else "Inactive ⚫"
+                self.status_text.insert(tk.END, f"{esp.id}: {active_str}, Battery: {esp.battery:.1f}%\n")
+
+            self.status_text.insert(tk.END, "\n=== CAR STATUS ===\n")
+            for car in self.system.cars:
+                self.status_text.insert(tk.END, f"{car.id}: {car.status}, Route: {car.route}\n")
+        except Exception as e:
+            print(f"Error in status display: {e}")
+
+    def update_message_log(self):
+        """Update message log display"""
+        try:
+            if len(self.system.message_log) > 20:  # Keep last 20 messages
+                self.msg_text.delete(1.0, tk.END)
+                self.msg_text.insert(tk.END, "ESP-NOW MESSAGE LOG\n")
+                self.msg_text.insert(tk.END, "=" * 50 + "\n\n")
+
+                for msg in self.system.message_log[-20:]:
+                    self.msg_text.insert(tk.END, f"[{msg['time']}]\n")
+                    self.msg_text.insert(tk.END, f"  Sender: {msg['sender']}\n")
+                    self.msg_text.insert(tk.END, f"  Receiver: {msg['receiver']}\n")
+                    self.msg_text.insert(tk.END, f"  Message: '{msg['message']}'\n")
+                    self.msg_text.insert(tk.END, f"  Action: {msg['action']}\n")
+                    self.msg_text.insert(tk.END, "-" * 40 + "\n")
+        except Exception as e:
+            print(f"Error in message log: {e}")
+
+    def update_event_log(self):
+        """Update event log display"""
+        try:
+            if len(self.system.event_log) > 30:  # Keep last 30 events
+                self.log_text.delete(1.0, tk.END)
+                for event in self.system.event_log[-30:]:
+                    self.log_text.insert(tk.END, event + "\n")
+                self.log_text.see(tk.END)
+        except Exception as e:
+            print(f"Error in event log: {e}")
+
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+
+def main():
+    root = tk.Tk()
+
+    # Add menu
+    menubar = tk.Menu(root)
+    root.config(menu=menubar)
+
+    file_menu = tk.Menu(menubar, tearoff=0)
+    menubar.add_cascade(label="File", menu=file_menu)
+    file_menu.add_command(label="Exit", command=root.quit)
+
+    help_menu = tk.Menu(menubar, tearoff=0)
+    menubar.add_cascade(label="Help", menu=help_menu)
+    help_menu.add_command(label="About", command=lambda: messagebox.showinfo(
+        "About",
+        "Auto Traffic Management System\n\n"
+        "Simulates 3 ESP-32 devices, 5 cars, and 2 sensors\n"
+        "using ESP-NOW protocol for real-time communication.\n\n"
+        "System runs automatically - just watch and control!"
+    ))
+
+    # Create app
+    app = AutoTrafficSystemGUI(root)
+
+    # Center window
+    root.update_idletasks()
+    width = root.winfo_width()
+    height = root.winfo_height()
+    x = (root.winfo_screenwidth() // 2) - (width // 2)
+    y = (root.winfo_screenheight() // 2) - (height // 2)
+    root.geometry(f'{width}x{height}+{x}+{y}')
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
